@@ -31,15 +31,15 @@ cd jadx
 
 ## Changes in this fork
 
-. Following androguard documentation on [using androlyze](https://androguard.readthedocs.io/en/latest/intro/gettingstarted.html#using-androlyze-and-the-python-api), the script now uses the androguard-generated Analysis object, not the DEX object.
+* Following androguard documentation on [using androlyze](https://androguard.readthedocs.io/en/latest/intro/gettingstarted.html#using-androlyze-and-the-python-api), the script now uses the androguard-generated Analysis object, not the DEX object.
 
-. Method signatures have been changed to use the Analysis object instead of DEX, and to remove any arguments that previously were never used, in the interest of clarity.
+* Method signatures have been changed to use the Analysis object instead of DEX, and to remove any arguments that previously were never used, in the interest of clarity.
 
-. json output generated from XML using [xmltodict](https://github.com/martinblech/xmltodict).
+* json output generated from XML using [xmltodict](https://github.com/martinblech/xmltodict).
 
-. Added JADX decompiler option.
+* Added JADX decompiler option.
 
-. Added a method to call mallodroid as a module, rather than from the command line:
+* Added a method to call mallodroid as a module, rather than from the command line:
 
 ```python
 def check_apk(path_to_apk: str, output: Output, decompiler: Decompiler, store_source:bool =False):
