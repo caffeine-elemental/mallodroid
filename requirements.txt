@@ -1,0 +1,2 @@
+androguard[magic,GUI]
+xmltodict

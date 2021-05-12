@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # encoding: utf-8
 """
 # This file is part of MalloDroid which is built up-on Androguard.
@@ -20,411 +20,499 @@
 # along with MalloDroid.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-from androguard.core.bytecodes import apk, dvm
-from androguard.core.analysis import analysis
-from androguard.decompiler.dad import decompile
-from androguard.core.bytecodes.dvm import DalvikVMFormat
+from androguard.core.analysis.analysis import Analysis, ExternalMethod
 from androguard.core.bytecodes.apk import APK
-from androguard.core.analysis.analysis import uVMAnalysis
-from androguard.core.analysis.ganalysis import GVMAnalysis
+from androguard.core.bytecodes.dvm import DalvikVMFormat
+from androguard.decompiler.decompiler import DecompilerJADX, DecompilerDAD
 
-import sys
 import os
 import base64
-import pprint
-import datetime
 import argparse
 
-def _get_java_code(_class, _vmx):
+import json
+import xmltodict
+
+from enum import Enum, auto
+
+import logging
+logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s', datefmt='%Y-%m-%d:%H:%M:%S', level='ERROR')
+logger = logging.getLogger(__name__)
+
+
+class Output(Enum):
+	JSON = auto()
+	XML = auto()
+
+class Decompiler(Enum):
+	DAD = auto()
+	JADX = auto()
+
+def _get_java_code(classAnalysis):
 	try:
-		_ms = decompile.DvClass(_class, _vmx)
-		_ms.process()
-		return _ms.get_source()
-	except Exception, e:
-		print "Error getting Java source code for: {:s}".format(_class.get_name())
+		return classAnalysis.get_vm_class().get_source()
+	except Exception as e:
+		logger.debug(f"Error getting Java source code for: {classAnalysis.get_vm_class().get_name()}")
 	return None
+	
+def _has_signature(method, signatures):
 
-def _has_signature(_method, _signatures):
-	_name = _method.get_name()
-	_return = _method.get_information().get('return', None)
-	_params = [_p[1] for _p in _method.get_information().get('params', [])]
-	_access_flags = _method.get_access_flags_string()
+	name = method.name
+	_return = method.get_information().get('return', None)
+	params = [_[1] for _ in method.get_information().get('params', [])]
+	access_flags = method.get_access_flags_string()
 
-	for _signature in _signatures:
-		if (_access_flags == _signature['access_flags']) \
-				and (_name == _signature['name']) \
-				and (_return == _signature['return']) \
-				and (_params == _signature['params']):
+	for signature in signatures:
+		if (access_flags == signature['access_flags']) \
+				and (name == signature['name']) \
+				and (_return == signature['return']) \
+				and (params == signature['params']):
 			return True
 	return False
 
-def _class_implements_interface(_class, _interfaces):
-	return (_class.get_interfaces() and any([True for i in _interfaces if i in _class.get_interfaces()]))	
+def _class_implements_interface(classAnalysis, _interfaces):
 
-def _class_extends_class(_class, _classes):
-	return any([True for i in _classes if i == _class.get_superclassname()])
+	i = classAnalysis.implements
+	j = [True for _ in _interfaces if _ in classAnalysis.implements]
+	return (i and any(j))	
 
-def _get_method_instructions(_method):
-	_code = _method.get_code()
-	_instructions = []
-	if _code:
-		_bc = _code.get_bc()
-		for _instr in _bc.get_instructions():
-			_instructions.append(_instr)
-	return _instructions
+def _class_extends_class(classAnalysis, classes):
 
-def _returns_true(_method):
-	_instructions = _get_method_instructions(_method)
-	if len(_instructions) == 2:
-		_i = "->".join([_instructions[0].get_output(), _instructions[1].get_name() + "," + _instructions[1].get_output()])
-		_i = _i.replace(" ", "")
-		_v = _instructions[0].get_output().split(",")[0]
-		_x = "{:s},1->return,{:s}".format(_v, _v)
-		return _i == _x
+	return any([True for _ in classes if _ == classAnalysis.extends])
+
+def _get_method_instructions(method):
+
+	code = method.get_code()
+	instructions = []
+	if code:
+		bc = code.get_bc()
+		for instr in bc.get_instructions():
+			instructions.append(instr)
+	return instructions
+
+def _returns_true(method):
+
+	instructions = _get_method_instructions(method)
+	if len(instructions) == 2:
+		i = "->".join([instructions[0].get_output(), instructions[1].get_name() + "," + instructions[1].get_output()])
+		i = i.replace(" ", "")
+		v = instructions[0].get_output().split(",")[0]
+		x = "{:s},1->return,{:s}".format(v, v)
+		return i == x
 	return False
 
-def _returns_void(_method):
-	_instructions = _get_method_instructions(_method)
-	if len(_instructions) == 1:
-		return _instructions[0].get_name() == "return-void"
+def _returns_void(method):
+
+	instructions = _get_method_instructions(method)
+	if len(instructions) == 1:
+		return instructions[0].get_name() == "return-void"
 	return False
 
-def _instantiates_allow_all_hostname_verifier(_method):
-	if not _method.get_class_name() == "Lorg/apache/http/conn/ssl/SSLSocketFactory;":
-		_instructions = _get_method_instructions(_method)
-		for _i in _instructions:
-			if _i.get_name() == "new-instance" and _i.get_output().endswith('Lorg/apache/http/conn/ssl/AllowAllHostnameVerifier;'):
+def _instantiates_allow_all_hostname_verifier(method):
+
+	if not method.get_class_name() == "Lorg/apache/http/conn/ssl/SSLSocketFactory;":
+		instructions = _get_method_instructions(method)
+		for i in instructions:
+			if i.get_name() == "new-instance" and i.get_output().endswith('Lorg/apache/http/conn/ssl/AllowAllHostnameVerifier;'):
 				return True
-			elif _i.get_name() == "sget-object" and 'Lorg/apache/http/conn/ssl/SSLSocketFactory;->ALLOW_ALL_HOSTNAME_VERIFIER' in _i.get_output():
+			elif i.get_name() == "sget-object" and 'Lorg/apache/http/conn/ssl/SSLSocketFactory;->ALLOW_ALL_HOSTNAME_VERIFIER' in i.get_output():
 				return True
 	return False
 
-def _instantiates_get_insecure_socket_factory(_method):
-	_instructions = _get_method_instructions(_method)
-	for _i in _instructions:
-		if _i.get_name() == "invoke-static" and _i.get_output().endswith('Landroid/net/SSLCertificateSocketFactory;->getInsecure(I Landroid/net/SSLSessionCache;)Ljavax/net/ssl/SSLSocketFactory;'):
+def _instantiates_get_insecure_socket_factory(method):
+
+	instructions = _get_method_instructions(method)
+	for i in instructions:
+		if i.get_name() == "invoke-static" and i.get_output().endswith('Landroid/net/SSLCertificateSocketFactory;->getInsecure(I Landroid/net/SSLSessionCache;)Ljavax/net/ssl/SSLSocketFactory;'):
 			return True
 	return False
 
-def _get_javab64_xref(_class, _vmx):
-	_java_b64 = base64.b64encode(_get_java_code(_class, _vmx))
-	_xref = None
+def _get_javab64_xref(classAnalysis):
+
+	java_code = _get_java_code(classAnalysis)
+	java_b64 = base64.b64encode(java_code.encode('utf-8'))
+	xref = None
 	try:
-		_xref = _class.XREFfrom
-		if _xref:
-			_xref = [_m[0] for _m in _xref.items]
+		xref = classAnalysis.get_xref_from()
 	except AttributeError:
 		pass
-	return _java_b64, _xref
+	return java_b64, xref
 
-def _check_trust_manager(_method, _vm, _vmx):
+def _check_trust_manager(method, analysis):
+
 	_check_server_trusted = {'access_flags' : 'public', 'return' : 'void', 'name' : 'checkServerTrusted', 'params' : ['java.security.cert.X509Certificate[]', 'java.lang.String']}
 	_trustmanager_interfaces = ['Ljavax/net/ssl/TrustManager;', 'Ljavax/net/ssl/X509TrustManager;']
-	_custom_trust_manager = []
-	_insecure_socket_factory = []
+	custom_trust_manager = []
+	insecure_socket_factory = []
 	
-	if _has_signature(_method, [_check_server_trusted]):
-		_class = _vm.get_class(_method.get_class_name())
-		if _class_implements_interface(_class, _trustmanager_interfaces):
-			_java_b64, _xref = _get_javab64_xref(_class, _vmx)
-			_empty = _returns_true(_method) or _returns_void(_method)
-			_custom_trust_manager.append({'class' : _class, 'xref' : _xref, 'java_b64' : _java_b64, 'empty' : _empty})
-	if _instantiates_get_insecure_socket_factory(_method):
-		_class = _vm.get_class(_method.get_class_name())
-		_java_b64, _xref = _get_javab64_xref(_class, _vmx)
-		_insecure_socket_factory.append({'class' : _class, 'method' : _method, 'java_b64' : _java_b64})
+	classAnalysis = analysis.get_class_analysis(method.get_class_name())
+	
+	if _has_signature(method, [_check_server_trusted]):
 
-	return _custom_trust_manager, _insecure_socket_factory
-
-def _check_hostname_verifier(_method, _vm, _vmx):
-	_verify_string_sslsession = {'access_flags' : 'public', 'return' : 'boolean', 'name' : 'verify', 'params' : ['java.lang.String', 'javax.net.ssl.SSLSession']}
-	_verify_string_x509cert = {'access_flags' : 'public', 'return' : 'void', 'name' : 'verify', 'params' : ['java.lang.String', 'java.security.cert.X509Certificate']}
-	_verify_string_sslsocket = {'access_flags' : 'public', 'return' : 'void', 'name' : 'verify', 'params' : ['java.lang.String', 'javax.net.ssl.SSLSocket']}
-	_verify_string_subj_alt = {'access_flags' : 'public', 'return' : 'void', 'name' : 'verify', 'params' : ['java.lang.String', 'java.lang.String[]', 'java.lang.String[]']}
-	_verifier_interfaces = ['Ljavax/net/ssl/HostnameVerifier;', 'Lorg/apache/http/conn/ssl/X509HostnameVerifier;']
-	_verifier_classes = ['L/org/apache/http/conn/ssl/AbstractVerifier;', 'L/org/apache/http/conn/ssl/AllowAllHostnameVerifier;', \
-				'L/org/apache/http/conn/ssl/BrowserCompatHostnameVerifier;', 'L/org/apache/http/conn/ssl/StrictHostnameVerifier;']
-	_custom_hostname_verifier = []
-	_allow_all_hostname_verifier = []
-	
-	if _has_signature(_method, [_verify_string_sslsession, _verify_string_x509cert, _verify_string_sslsocket, _verify_string_subj_alt]):
-		_class = _vm.get_class(_method.get_class_name())
-		if _class_implements_interface(_class, _verifier_interfaces) or _class_extends_class(_class, _verifier_classes):
-			_java_b64, _xref = _get_javab64_xref(_class, _vmx)
-			_empty = _returns_true(_method) or _returns_void(_method)
-			_custom_hostname_verifier.append({'class' : _class, 'xref' : _xref, 'java_b64' : _java_b64, 'empty' : _empty})
-	if _instantiates_allow_all_hostname_verifier(_method):
-		_class = _vm.get_class(_method.get_class_name())
-		_java_b64, _xref = _get_javab64_xref(_class, _vmx)
-		_allow_all_hostname_verifier.append({'class' : _class, 'method' : _method, 'java_b64' : _java_b64})
-	
-	return _custom_hostname_verifier, _allow_all_hostname_verifier
-
-def _check_ssl_error(_method, _vm, _vmx):
-	_on_received_ssl_error = {'access_flags' : 'public', 'return' : 'void', 'name' : 'onReceivedSslError', 'params' : ['android.webkit.WebView', 'android.webkit.SslErrorHandler', 'android.net.http.SslError']}
-	_webviewclient_classes = ['Landroid/webkit/WebViewClient;']
-	_custom_on_received_ssl_error = []
-	
-	if _has_signature(_method, [_on_received_ssl_error]):
-		_class = _vm.get_class(_method.get_class_name())
-		if _class_extends_class(_class, _webviewclient_classes) or True:
-			_java_b64, _xref = _get_javab64_xref(_class, _vmx)
-			_empty = _returns_true(_method) or _returns_void(_method)
-			_custom_on_received_ssl_error.append({'class' : _class, 'xref' : _xref, 'java_b64' : _java_b64, 'empty' : _empty})
-	
-	return _custom_on_received_ssl_error
-
-def _check_all(_vm, _vmx, _gx):
-	
-	_custom_trust_manager = []
-	_insecure_socket_factory = []
-	
-	_custom_hostname_verifier = []
-	_allow_all_hostname_verifier = []
-	
-	_custom_on_received_ssl_error = []
-	
-	for _method in _vm.get_methods():
-		_hv, _a = _check_hostname_verifier(_method, _vm, _vmx)
-		if len(_hv) > 0:
-			_custom_hostname_verifier += _hv
-		if len(_a) > 0:
-			_allow_all_hostname_verifier += _a
-
- 		_tm, _i = _check_trust_manager(_method, _vm, _vmx)
-		if len(_tm) > 0:
-			_custom_trust_manager += _tm
-		if len(_i) > 0:
-			_insecure_socket_factory += _i
-
-		_ssl = _check_ssl_error(_method, _vm, _vmx)
-		if len(_ssl) > 0:
-			_custom_on_received_ssl_error += _ssl
-
-	return { 'trustmanager' : _custom_trust_manager, 'insecuresocketfactory' : _insecure_socket_factory, 'customhostnameverifier' : _custom_hostname_verifier, 'allowallhostnameverifier' : _allow_all_hostname_verifier, 'onreceivedsslerror' : _custom_on_received_ssl_error}
-
-def _print_result(_result, _java=True):
-	print "Analysis result:"
-	
-	if len(_result['trustmanager']) > 0:
-		if len(_result['trustmanager']) == 1:
-			print "App implements custom TrustManager:"
-		elif len(_result['trustmanager']) > 1:
-			print "App implements {:d} custom TrustManagers".format(len(_result['trustmanager']))
+		if _class_implements_interface(classAnalysis, _trustmanager_interfaces):
+			java_b64, xref = _get_javab64_xref(classAnalysis)
+			_empty = _returns_true(method) or _returns_void(method)
+			custom_trust_manager.append({'class' : classAnalysis, 'xref' : xref, 'java_b64' : java_b64, 'empty' : _empty})
 			
-		for _tm in _result['trustmanager']:
-			_class_name = _tm['class'].get_name()
-			print "\tCustom TrustManager is implemented in class {:s}".format(_translate_class_name(_class_name))
-			if _tm['empty']:
-				print "\tImplements naive certificate check. This TrustManager breaks certificate validation!"
-			for _ref in _tm['xref']:
-				print "\t\tReferenced in method {:s}->{:s}".format(_translate_class_name(_ref.get_class_name()), _ref.get_name())
-			if _java:
-				print "\t\tJavaSource code:"
-				print "{:s}".format(base64.b64decode(_tm['java_b64']))
+	if _instantiates_get_insecure_socket_factory(method):
+
+		java_b64, xref = _get_javab64_xref(classAnalysis)
+		insecure_socket_factory.append({'class' : classAnalysis, 'method' : method, 'java_b64' : java_b64})
+
+	return custom_trust_manager, insecure_socket_factory
+
+def _check_hostname_verifier(method, analysis):
+
+	verify_string_sslsession = {'access_flags' : 'public', 'return' : 'boolean', 'name' : 'verify', 'params' : ['java.lang.String', 'javax.net.ssl.SSLSession']}
+	verify_string_x509cert = {'access_flags' : 'public', 'return' : 'void', 'name' : 'verify', 'params' : ['java.lang.String', 'java.security.cert.X509Certificate']}
+	verify_string_sslsocket = {'access_flags' : 'public', 'return' : 'void', 'name' : 'verify', 'params' : ['java.lang.String', 'javax.net.ssl.SSLSocket']}
+	verify_string_subj_alt = {'access_flags' : 'public', 'return' : 'void', 'name' : 'verify', 'params' : ['java.lang.String', 'java.lang.String[]', 'java.lang.String[]']}
+	verifier_interfaces = ['Ljavax/net/ssl/HostnameVerifier;', 'Lorg/apache/http/conn/ssl/X509HostnameVerifier;']
+	verifier_classes = ['L/org/apache/http/conn/ssl/AbstractVerifier;', 'L/org/apache/http/conn/ssl/AllowAllHostnameVerifier;', \
+				'L/org/apache/http/conn/ssl/BrowserCompatHostnameVerifier;', 'L/org/apache/http/conn/ssl/StrictHostnameVerifier;']
+	custom_hostname_verifier = []
+	allow_all_hostname_verifier = []
+
+	classAnalysis = analysis.get_class_analysis(method.get_class_name())
 	
-	if len(_result['insecuresocketfactory']) > 0:
-		if len(_result['insecuresocketfactory']) == 1:
-			print "App instantiates insecure SSLSocketFactory:"
-		elif len(_result['insecuresocketfactory']) > 1:
-			print "App instantiates {:d} insecure SSLSocketFactorys".format(len(_result['insecuresocketfactory']))
+	if _has_signature(method, [verify_string_sslsession, verify_string_x509cert, verify_string_sslsocket, verify_string_subj_alt]):
 		
-		for _is in _result['insecuresocketfactory']:
-			_class_name = _translate_class_name(_is['class'].get_name())
-			print "\tInsecure SSLSocketFactory is instantiated in {:s}->{:s}".format(_class_name, _is['method'].get_name())
-			if _java:
-				print "\t\tJavaSource code:"
-				print "{:s}".format(base64.b64decode(_is['java_b64']))
+		if _class_implements_interface(classAnalysis, verifier_interfaces) or _class_extends_class(classAnalysis, verifierclasses):
+			java_b64, xref = _get_javab64_xref(classAnalysis)
+			_empty = _returns_true(method) or _returns_void(method)
+			custom_hostname_verifier.append({'class' : classAnalysis, 'xref' : xref, 'java_b64' : java_b64, 'empty' : _empty})
+	if _instantiates_allow_all_hostname_verifier(method):
+		
+		java_b64, xref = _get_javab64_xref(classAnalysis)
+		allow_all_hostname_verifier.append({'class' : _class, 'method' : method, 'java_b64' : java_b64})
+	
+	return custom_hostname_verifier, allow_all_hostname_verifier
 
-	if len(_result['customhostnameverifier']) > 0:
-		if len(_result['customhostnameverifier']) == 1:
-			print "App implements custom HostnameVerifier:"
-		elif len(_result['customhostnameverifier']) > 1:
-			print "App implements {:d} custom HostnameVerifiers".format(len(_result['customhostnameverifier']))
+def _check_ssl_error(method, analysis):
 
-		for _hv in _result['customhostnameverifier']:
-			_class_name = _hv['class'].get_name()
-			print "\tCustom HostnameVerifiers is implemented in class {:s}".format(_translate_class_name(_class_name))
-			if _hv['empty']:
-				print "\tImplements naive hostname verification. This HostnameVerifier breaks certificate validation!"
-			for _ref in _tm['xref']:
-				print "\t\tReferenced in method {:s}->{:s}".format(_translate_class_name(_ref.get_class_name()), _ref.get_name())
-			if _java:
-				print "\t\tJavaSource code:"
-				print "{:s}".format(base64.b64decode(_hv['java_b64']))
+	_on_received_ssl_error = {'access_flags' : 'public', 'return' : 'void', 'name' : 'onReceivedSslError', 'params' : ['android.webkit.WebView', 'android.webkit.SslErrorHandler', 'android.net.http.SslError']}
+	_webviewclientclasses = ['Landroid/webkit/WebViewClient;']
+	custom_on_received_ssl_error = []
+	
+	if _has_signature(method, [_on_received_ssl_error]):
+		classAnalysis = analysis.get_class_analysis(method.get_class_name())
+		if _class_extends_class(classAnalysis, _webviewclientclasses) or True:
+			java_b64, xref = _get_javab64_xref(classAnalysis)
+			_empty = _returns_true(method) or _returns_void(method)
+			custom_on_received_ssl_error.append({'class' : classAnalysis, 'xref' : xref, 'java_b64' : java_b64, 'empty' : _empty})
+	
+	return custom_on_received_ssl_error
 
-	if len(_result['allowallhostnameverifier']) > 0:
-		if len(_result['allowallhostnameverifier']) == 1:
-			print "App instantiates AllowAllHostnameVerifier:"
-		elif len(_result['allowallhostnameverifier']) > 1:
-			print "App instantiates {:d} AllowAllHostnameVerifiers".format(len(_result['allowallhostnameverifier']))
+def _check_all(analysis):
+	
+	custom_trust_manager = []
+	insecure_socket_factory = []
+	
+	custom_hostname_verifier = []
+	allow_all_hostname_verifier = []
+	
+	custom_on_received_ssl_error = []
 
-		for _aa in _result['allowallhostnameverifier']:
-			_class_name = _translate_class_name(_aa['class'].get_name())
-			print "\tAllowAllHostnameVerifier is instantiated in {:s}->{:s}".format(_class_name, _aa['method'].get_name())
-		if _java:
-			print "\t\tJavaSource code:"
-			print "{:s}".format(base64.b64decode(_aa['java_b64']))
+	for method in analysis.methods:
+	
+		#method = methodAnalysis.getmethod()
+		
+		if not isinstance(method, ExternalMethod):
+		
+			hv, a = _check_hostname_verifier(method, analysis)
+			
+			if len(hv) > 0:
+				custom_hostname_verifier += hv
+			if len(a) > 0:
+				allow_all_hostname_verifier += a
 
-def _xml_result(_a, _result):
+			tm, i = _check_trust_manager(method, analysis)
+			if len(tm) > 0:
+				custom_trust_manager += tm
+			if len(i) > 0:
+				insecure_socket_factory += i
+
+			ssl = _check_ssl_error(method, analysis)
+			if len(ssl) > 0:
+				custom_on_received_ssl_error += ssl
+
+	return { 'trustmanager' : custom_trust_manager, 'insecuresocketfactory' : insecure_socket_factory, 'customhostnameverifier' : custom_hostname_verifier, 'allowallhostnameverifier' : allow_all_hostname_verifier, 'onreceivedsslerror' : custom_on_received_ssl_error}
+
+def _print_result(result, java=True):
+
+	print("Analysis result:")
+	
+	if len(result['trustmanager']) > 0:
+		if len(result['trustmanager']) == 1:
+			print("App implements custom TrustManager:")
+		elif len(result['trustmanager']) > 1:
+			print("App implements {len(result['trustmanager'])} custom TrustManagers")
+			
+		for tm in result['trustmanager']:
+			class_name = tm['class'].name
+			print(f"\tCustom TrustManager is implemented in class {_translate_class_name(class_name)}")
+			if tm['empty']:
+				print("\tImplements naive certificate check. This TrustManager breaks certificate validation!")
+			for xref in tm['xref']:
+				print(f"\t\tReferenced in method {_translate_class_name(xref.name)}->{xref.name}")
+			if java:
+				print("\t\tJavaSource code:")
+				print(f"{base64.b64decode(tm['java_b64']).decode('utf-8')}")
+	
+	if len(result['insecuresocketfactory']) > 0:
+		if len(result['insecuresocketfactory']) == 1:
+			print("App instantiates insecure SSLSocketFactory:")
+		elif len(result['insecuresocketfactory']) > 1:
+			print(f"App instantiates {len(result['insecuresocketfactory'])} insecure SSLSocketFactorys")
+		
+		for isf in result['insecuresocketfactory']:
+			class_name = _translate_class_name(isf['class'].name)
+			print(f"\tInsecure SSLSocketFactory is instantiated in {class_name}->{isf['method'].name}")
+			if java:
+				print("\t\tJavaSource code:")
+				print(f"{base64.b64decode(isf['java_b64']).decode('utf-8')}")
+
+	if len(result['customhostnameverifier']) > 0:
+		if len(result['customhostnameverifier']) == 1:
+			print("App implements custom HostnameVerifier:")
+		elif len(result['customhostnameverifier']) > 1:
+			print(f"App implements {len(result['customhostnameverifier'])} custom HostnameVerifiers")
+
+		for chnv in result['customhostnameverifier']:
+			class_name = chnv['class'].name
+			print(f"\tCustom HostnameVerifiers is implemented in class {_translate_class_name(class_name)}")
+			if chnv['empty']:
+				print("\tImplements naive hostname verification. This HostnameVerifier breaks certificate validation!")
+			for xref in chnv['xref']:
+				print(f"\t\tReferenced in method {_translate_class_name(xref.name)}->{xref.name}")
+			if java:
+				print("\t\tJavaSource code:")
+				print(f"{base64.b64decode(chnv['java_b64']).decode('utf-8')}")
+
+	if len(result['allowallhostnameverifier']) > 0:
+		if len(result['allowallhostnameverifier']) == 1:
+			print("App instantiates AllowAllHostnameVerifier:")
+		elif len(result['allowallhostnameverifier']) > 1:
+			print(f"App instantiates {len(result['allowallhostnameverifier'])} AllowAllHostnameVerifiers")
+
+		for ahnv in result['allowallhostnameverifier']:
+			class_name = _translate_class_name(ahnv['class'].name)
+			print(f"\tAllowAllHostnameVerifier is instantiated in {class_name}->{ahnv['method'].name}")
+		if java:
+			print("\t\tJavaSource code:")
+			print(f"{base64.b64decode(ahnv['java_b64']).decode('utf-8')}")
+
+def _result_xml(package_name, result):
+
 	from xml.etree.ElementTree import Element, SubElement, tostring, dump
 	import xml.dom.minidom
 	
-	_result_xml = Element('result')
-	_result_xml.set('package', _a.get_package())
-	_tms = SubElement(_result_xml, 'trustmanagers')
-	_hvs = SubElement(_result_xml, 'hostnameverifiers')
-	_orse = SubElement(_result_xml, 'onreceivedsslerrors')
+	result_xml = Element('result')
+	result_xml.set('package', package_name)
+	trustmanagers = SubElement(result_xml, 'trustmanagers')
+	hostnameverifiers = SubElement(result_xml, 'hostnameverifiers')
+	onreceivedsslerrors = SubElement(result_xml, 'onreceivedsslerrors')
 
-	print "\nXML output:\n"
-
-	for _tm in _result['trustmanager']:
-		_class_name = _translate_class_name(_tm['class'].get_name())
-		_t = SubElement(_tms, 'trustmanager')
-		_t.set('class', _class_name)
-		if _tm['empty']:
-			_t.set('broken', 'True')
+	for tm in result['trustmanager']:
+		class_name = _translate_class_name(tm['class'].name)
+		t = SubElement(trustmanagers, 'trustmanager')
+		t.set('class', class_name)
+		if tm['empty']:
+			t.set('broken', 'True')
 		else:
-			_t.set('broken', 'Maybe')
+			t.set('broken', 'Maybe')
 		
-		for _r in _tm['xref']:
-			_rs = SubElement(_t, 'xref')
-			_rs.set('class', _translate_class_name(_r.get_class_name()))
-			_rs.set('method', _r.get_name())
+		for r in tm['xref']:
+			rs = SubElement(t, 'xref')
+			rs.set('class', _translate_class_name(r.get_class_name()))
+			rs.set('method', r.name)
 	
-	if len(_result['insecuresocketfactory']):
-		for _is in _result['insecuresocketfactory']:
-			_class_name = _translate_class_name(_is['class'].get_name())
-			_i = SubElement(_tms, 'insecuresslsocket')
-			_i.set('class', _class_name)
-			_i.set('method', _is['method'].get_name())
+	if len(result['insecuresocketfactory']):
+		for isf in result['insecuresocketfactory']:
+			class_name = _translate_class_name(isf['class'].name)
+			i = SubElement(trustmanagers, 'insecuresslsocket')
+			i.set('class', class_name)
+			i.set('method', isf['method'].name)
 	else:
-		_i = SubElement(_tms, 'insecuresslsocket')
+		i = SubElement(trustmanagers, 'insecuresslsocket')
 
 
-	for _hv in _result['customhostnameverifier']:
-		_class_name = _translate_class_name(_hv['class'].get_name())
-		_h = SubElement(_hvs, 'hostnameverifier')
-		_h.set('class', _class_name)
-		if _hv['empty']:
-			_h.set('broken', 'True')
+	for chnv in result['customhostnameverifier']:
+		class_name = _translate_class_name(chnv['class'].name)
+		hnv = SubElement(hostnameverifiers, 'hostnameverifier')
+		hnv.set('class', class_name)
+		if chnv['empty']:
+			hnv.set('broken', 'True')
 		else:
-			_h.set('broken', 'Maybe')
+			hnv.set('broken', 'Maybe')
 		
-		for _ref in _hv['xref']:
-			_hs = SubElement(_h, 'xref')
-			_hs.set('class', _translate_class_name(_ref.get_class_name()))
-			_hs.set('method', _ref.get_name())
+		for xref in chnv['xref']:
+			chnv_xref = SubElement(hnv, 'xref')
+			chnv_xref.set('class', _translate_class_name(xref.name))
+			chnv_xref.set('method', xref.name)
 	
-	if len(_result['allowallhostnameverifier']):
-		for _aa in _result['allowallhostnameverifier']:
-			_class_name = _translate_class_name(_aa['class'].get_name())
-			_a = SubElement(_hvs, 'allowhostnames')
-			_a.set('class', _class_name)
-			_a.set('method', _aa['method'].get_name())
+	if len(result['allowallhostnameverifier']):
+		for ahnv in result['allowallhostnameverifier']:
+			class_name = _translate_class_name(ahnv['class'].name)
+			ahn = SubElement(hostnameverifiers, 'allowhostnames')
+			ahn.set('class', class_name)
+			ahn.set('method', ahnv['method'].name)
 	else:
-		_a = SubElement(_hvs, 'allowhostnames')
+		ahn = SubElement(hostnameverifiers, 'allowhostnames')
 
-	for _se in _result['onreceivedsslerror']:
-		_class_name = _translate_class_name(_se['class'].get_name())
-		_s = SubElement(_orse, 'sslerror')
-		_s.set('class', _class_name)
-		if _se['empty']:
-			_s.set('broken', 'True')
+	for orsse in result['onreceivedsslerror']:
+		class_name = _translate_class_name(orsse['class'].name)
+		sse = SubElement(onreceivedsslerrors, 'sslerror')
+		sse.set('class', class_name)
+		if orsse['empty']:
+			sse.set('broken', 'True')
 		else:
-			_s.set('broken', 'Maybe')
+			sse.set('broken', 'Maybe')
 
-		for _ref in _se['xref']:
-			_ss = SubElement(_s, 'xref')
-			_ss.set('class', _translate_class_name(_ref.get_class_name()))
-			_ss.set('method', _ref.get_name())
-		
+		for xref in orsse['xref']:
+			sse_xref = SubElement(sse, 'xref')
+			sse_xref.set('class', _translate_class_name(xref.name))
+			sse_xref.set('method', xref.name)
 	
-	_xml = xml.dom.minidom.parseString(tostring(_result_xml, method="xml"))
-	print _xml.toprettyxml()
+	_xml = xml.dom.minidom.parseString(tostring(result_xml, method="xml"))
+	
+	logger.debug("\nXML output:\n")
+	logger.debug(f'{_xml.toprettyxml()}')
+	
+	return(_xml.toprettyxml())
 
-def _translate_class_name(_class_name):
-	_class_name = _class_name[1:-1]
-	_class_name = _class_name.replace("/", ".")
-	return _class_name
+def _translate_class_name(class_name):
+	
+	class_name = class_name[1:-1]
+	class_name = class_name.replace("/", ".")
+	return class_name
 
-def _file_name(_class_name, _base_dir):
-	_class_name = _class_name[1:-1]
-	_f = os.path.join(_base_dir, _class_name + ".java")
+def _file_name(class_name, _basedir):
+
+	class_name = class_name[1:-1]
+	_f = os.path.join(_basedir, class_name + ".java")
 	return _f
 
-def _ensure_dir(_d):
-	d = os.path.dirname(_d)
+def _ensuredir(d):
+
+	d = os.path.dirname(d)
 	if not os.path.exists(d):
 		os.makedirs(d)
 
-def _store_java(_vm, _args):
-	_vm.create_python_export()
-	_vmx = uVMAnalysis(_vm)
-	_gx = GVMAnalysis(_vmx, None)
-	_vm.set_vmanalysis(_vmx)
-	_vm.set_gvmanalysis(_gx)
-	_vm.create_dref(_vmx)
-	_vm.create_xref(_vmx)
+def _store_java(analysis, folder):
 
-	for _class in _vm.get_classes():
+	for classAnalysis in analysis.get_internal_classes():
+		
+		source = classAnalysis.get_vm_class().get_source()
+		
 		try:
-			_ms = decompile.DvClass(_class, _vmx)
-			_ms.process()
-			_f = _file_name(_class.get_name(), _args.storejava)
-			_ensure_dir(_f)
-			with open(_f, "w") as f:
-				_java = str(_ms.get_source())
-				f.write(_java)
-		except Exception, e:
-			print("Could not process {:s}: {:s}".format(_class.get_name(), str(e)))
-
-
+			filename = _file_name(classAnalysis.name, folder)
+			_ensuredir(filename)
+			
+			with open(filename, "w") as f:
+			
+				f.write(source)
+				
+		except Exception as e:
+		
+			logger.debug(f"Could not process {classAnalysis.name}: {e}")
+					
 def _parseargs():
+
 	parser = argparse.ArgumentParser(description="Analyse Android Apps for broken SSL certificate validation.")
 	parser.add_argument("-f", "--file", help="APK File to check", type=str, required=True)
 	parser.add_argument("-j", "--java", help="Show Java code for results for non-XML output", action="store_true", required=False)
-	parser.add_argument("-x", "--xml", help="Print XML output", action="store_true", required=False)	
+	parser.add_argument("-x", "--xml", help="Print XML output", action="store_true", required=False)
 	parser.add_argument("-d", "--dir", help="Store decompiled App's Java code for further analysis in dir", type=str, required=False)
-	args = parser.parse_args()
+	parser.add_argument("-D", "--decompiler", help="Specify decompiler: DAD or JADX.", type=str, required=False, default='DAD')
+	arguments = parser.parse_args()
 
-	return args
+	return arguments
 
+def check_apk(path_to_apk: str, output: Output, decompiler: Decompiler, store_source:bool =False):
+
+	apk = APK(path_to_apk)
+	dex = DalvikVMFormat(apk)
+	analysis = Analysis(dex)
+		
+	if decompiler == Decompiler.JADX:
+
+		decompiler = DecompilerJADX(dex, analysis)
+
+	elif decompiler == Decompiler.DAD:
+	
+		decompiler = DecompilerDAD(dex, analysis)
+
+	dex.set_decompiler(decompiler)
+	dex.set_vmanalysis(analysis)
+		
+	package_name = apk.get_package()
+	
+	if store_source:
+		(apk_folder, apk_file) = os.path.split(path_to_apk)
+		(apk_name, _) = os.path.splitext(apk_file)
+		java_out_folder = os.path.join(apk_folder, apk_name)
+		print(f"Store decompiled Java code in {java_out_folder}")
+		_store_java(analysis, java_out_folder)
+		
+	return check_analysis(analysis, package_name, output)
+	
+def check_analysis(analysis: Analysis, package_name: str, output: Output):
+	
+	result = _check_all(analysis)
+	
+	x = _result_xml(package_name, result)
+	
+	if output == Output.XML:
+	
+		return(x)
+		
+	elif output == Output.JSON:
+
+		return json.dumps(xmltodict.parse(x, attr_prefix=''), indent='\t')	
+	
 def main():
 
-	_args = _parseargs()
+	arguments = _parseargs()
 	
-	_a = apk.APK(_args.file)
-	print("Analyse file: {:s}".format(_args.file))
-	print("Package name: {:s}".format(_a.get_package()))
-	
-	_vm = dvm.DalvikVMFormat(_a.get_dex())
-	_vmx = uVMAnalysis(_vm)
-	
-	if 'INTERNET' in _vmx.get_permissions([]):
-		print "App requires INTERNET permission. Continue analysis..."
-		
-		_vm.create_python_export()
-		_gx = GVMAnalysis(_vmx, None)
+	apk = APK(arguments.file)
+	dex = DalvikVMFormat(apk)
+	analysis = Analysis(dex)
 
-		_vm.set_vmanalysis(_vmx)
-		_vm.set_gvmanalysis(_gx)
-		_vm.create_dref(_vmx)
-		_vm.create_xref(_vmx)
-		
-		_result = {'trustmanager' : [], 'hostnameverifier' : [], 'onreceivedsslerror' : []}
-		_result = _check_all(_vm, _vmx, _gx)
-		
-		if not _args.xml:
-			_print_result(_result, _java=_args.java)
-		else:
-			_xml_result(_a, _result)
-		
-		if _args.dir:
-			print "Store decompiled Java code in {:s}".format(_args.dir)
-			_store_java(_vm, _args)
+	D = arguments.decompiler
+	if D == 'JADX':
+		decompiler = DecompilerJADX(dex, analysis)#, jadx = path_to_jadx)
+	elif D == 'DAD':
+		decompiler = DecompilerDAD(dex, analysis)
 	else:
-		print "App does not require INTERNET permission. No need to worry about SSL misuse... Abort!"
+		print(f'Warning: unknown decompiler {D}. Defaulting to DAD.')
+		decompiler = DecompilerDAD(dex, analysis)		
+	
+	dex.set_decompiler(decompiler)
+	dex.set_vmanalysis(analysis)
+	
+	print(f"Analyse file: {arguments.file}")
+	print(f"Package name: {apk.get_package()}")
+		
+	if 'android.permission.INTERNET' in apk.get_permissions():
+		print("App requires INTERNET permission. Continue analysis...")
+
+		result = {'trustmanager' : [], 'hostnameverifier' : [], 'onreceivedsslerror' : []}
+		result = _check_all(analysis)
+		
+		package_name = apk.get_package()
+		
+		if not arguments.xml:
+			_print_result(result, java=arguments.java)
+		else:
+			print(_result_xml(package_name, result))
+			
+		if arguments.dir:
+			folder = arguments.dir
+			print(f"Store decompiled Java code in {folder}")
+			_store_java(dex, folder)
+			
+	else:
+		print("App does not require INTERNET permission. No need to worry about SSL misuse. Analysis not carried out.")
 
 if __name__ == "__main__":
 	main()
